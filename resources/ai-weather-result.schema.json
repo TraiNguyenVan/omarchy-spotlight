@@ -51,12 +51,10 @@
               ]
             },
             "location": {
-              "type": "string",
-              "maxLength": 120
+              "type": "string"
             },
             "sourceUrl": {
-              "type": "string",
-              "maxLength": 2048
+              "type": "string"
             },
             "days": {
               "type": "array",
@@ -67,8 +65,7 @@
                     "type": "string"
                   },
                   "summary": {
-                    "type": "string",
-                    "maxLength": 100
+                    "type": "string"
                   },
                   "temperatureC": {
                     "type": [

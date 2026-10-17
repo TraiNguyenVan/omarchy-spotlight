@@ -207,6 +207,8 @@ TLDR_EXAMPLES = 16
 TLDR_FIELD_CHARS = 512
 AI_OUTPUT_BYTES = 512 * 1024
 AI_DEADLINE = 120.0
+AI_CATALOG_BYTES = 2 * 1024 * 1024
+AI_CATALOG_DEADLINE = 15.0
 AI_TEXT_CHARS = 16384
 AI_REPLY_CHARS = 524288  # Must match Spotlight.maxHelperPayloadChars (UTF-16 units).
 AI_GALLERY_DEADLINE = 10.0
@@ -1429,15 +1431,18 @@ def _menu_commands():
 
 # ---------------------------------------------------------------- commands
 def ai_catalogs():
-    """Project the installed CLIs' local model catalogs into bounded picker data."""
+    """Project the installed CLIs' model catalogs into bounded picker data."""
     catalogs = {"claude": [], "codex": []}
     try:
-        fd = walk([".codex"])
-        try:
-            cache = read_json(fd, "models_cache.json", 1024 * 1024, {})
-        finally:
-            os.close(fd)
-        models = cache.get("models", []) if isinstance(cache, dict) else []
+        if not shutil.which("codex"):
+            raise OSError("Codex CLI is not installed")
+        raw, truncated, status = run_bounded(
+            ["codex", "debug", "models"], AI_CATALOG_BYTES,
+            AI_CATALOG_DEADLINE, want_status=True)
+        if truncated or status != 0:
+            raise ValueError("Codex model catalog unavailable")
+        catalog = json.loads(raw.decode("utf-8", "replace"))
+        models = catalog.get("models", []) if isinstance(catalog, dict) else []
         for item in models[:50]:
             if not isinstance(item, dict) or item.get("visibility") != "list":
                 continue
@@ -3790,7 +3795,6 @@ def cmd_ai(argv):
                    "-c", "project_doc_max_bytes=0",
                    "--json",
                    "--skip-git-repo-check", "--sandbox", "read-only",
-                   "--disable", "shell_tool", "--disable", "unified_exec",
                    "--disable", "apps",
                    "--disable", "plugins", "--disable", "browser_use",
                    "--disable", "computer_use", "--disable", "image_generation",
@@ -3830,62 +3834,6 @@ def cmd_ai(argv):
     with (tempfile.TemporaryDirectory(prefix="spotlight-ai-", dir="/tmp")
           if provider == "codex" else nullcontext()) as directory:
         if directory is not None:
-            # Codex Structured Outputs accepts a stricter JSON Schema subset
-            # than Claude's --json-schema. Keep the canonical schema for
-            # Claude and adapt Codex's temporary copy: string length limits
-            # are checked locally, and optional object properties must be
-            # required but nullable in strict mode.
-            def codex_schema_compatible(value):
-                if isinstance(value, dict):
-                    result = {key: codex_schema_compatible(child)
-                              for key, child in value.items() if key != "maxLength"}
-                    schema_type = result.get("type")
-                    if isinstance(schema_type, list):
-                        result.pop("type")
-                        result["anyOf"] = [{"type": item} for item in schema_type]
-
-                    properties = result.get("properties")
-                    if isinstance(properties, dict):
-                        required = result.get("required", [])
-                        required_set = set(required) if isinstance(required, list) else set()
-                        for name, property_schema in properties.items():
-                            if name not in required_set:
-                                properties[name] = {"anyOf": [property_schema, {"type": "null"}]}
-                        result["required"] = list(properties)
-                    return result
-                if isinstance(value, list):
-                    return [codex_schema_compatible(child) for child in value]
-                return value
-
-            codex_schema = codex_schema_compatible(json.loads(schema))
-            codex_schema_path = os.path.join(directory, schema_name)
-            with open(codex_schema_path, "w", encoding="utf-8") as schema_file:
-                json.dump(codex_schema, schema_file, separators=(",", ":"))
-            command[command.index("--output-schema") + 1] = codex_schema_path
-
-            # Codex CLI can fail a request when its online model-catalog
-            # refresh times out, even when the selected model is already in
-            # its local cache. Give this invocation a static snapshot of that
-            # cache when it contains the requested model, avoiding the online
-            # refresh while keeping the user's normal Codex config untouched.
-            try:
-                codex_home_fd = walk([".codex"])
-                try:
-                    model_cache = read_json(codex_home_fd, "models_cache.json",
-                                            8 * 1024 * 1024, {})
-                finally:
-                    os.close(codex_home_fd)
-                cached_models = model_cache.get("models", []) if isinstance(model_cache, dict) else []
-                if (isinstance(model, str) and isinstance(cached_models, list)
-                        and any(isinstance(item, dict) and item.get("slug") == model
-                                for item in cached_models)):
-                    catalog_path = os.path.join(directory, "models.json")
-                    with open(catalog_path, "w", encoding="utf-8") as catalog_file:
-                        json.dump({"models": cached_models}, catalog_file,
-                                  separators=(",", ":"))
-                    command += ["-c", "model_catalog_json=" + json.dumps(catalog_path)]
-            except (OSError, Denied, TypeError, ValueError):
-                pass
             command += ["--cd", directory]
         raw, truncated, status = run_bounded(command, AI_OUTPUT_BYTES, AI_DEADLINE,
                                             instruction.encode("utf-8"), want_status=True,

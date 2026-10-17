@@ -464,7 +464,9 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
             self.assertEqual(os.getcwd(), cwd)
             self.assertIn("project_doc_max_bytes=0", argv)
-            self.assertTrue(Path(argv[argv.index("--output-schema") + 1]).is_absolute())
+            expected_schema = Path(HELPER.__file__).resolve().parent.parent / "resources" / "ai-result.schema.json"
+            self.assertEqual(Path(argv[argv.index("--output-schema") + 1]), expected_schema)
+            self.assertNotIn("model_catalog_json", argv)
             if len(directories) == 2:
                 raise HELPER.Denied("provider failed")
             result = {"kind": "answer", "text": "Hello", "commands": []}
@@ -514,9 +516,14 @@ class HelperTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--effort") + 1], "high")
             else:
                 self.assertIn("read-only", argv)
-                self.assertIn("shell_tool", argv)
+                self.assertNotIn(["--disable", "shell_tool"],
+                                 [argv[index:index + 2] for index in range(len(argv) - 1)])
+                self.assertNotIn(["--disable", "unified_exec"],
+                                 [argv[index:index + 2] for index in range(len(argv) - 1)])
                 self.assertIn('model_reasoning_effort="high"', argv)
                 self.assertIn('web_search="live"', argv)
+                self.assertEqual(argv[argv.index("--output-schema") + 1],
+                                 str(Path(HELPER.__file__).resolve().parent.parent / "resources" / "ai-result.schema.json"))
             self.assertEqual(argv[argv.index("--model") + 1], "test-model")
         for args in (["claude", "-evil", "high", "false"], ["claude", "opus", "ultra", "false"],
                      ["codex", "gpt-6-sol", "bogus", "false"], ["claude", "", "", "yes"]):
@@ -623,26 +630,58 @@ class HelperTests(unittest.TestCase):
                 reply = run(HELPER.cmd_ai, [provider, "", "", "true", "Tokyo", "true"], b"weather today")
             self.assertEqual(reply["result"]["artifacts"][0]["variant"], "forecast")
 
-    def test_ai_model_catalogs_follow_local_cli_options(self):
+    def test_ai_model_catalogs_use_codex_cli_catalog_and_claude_cache(self):
         with tempfile.TemporaryDirectory() as home:
             codex = Path(home, ".codex")
             claude = Path(home, ".claude", "cache", "model-catalog")
             codex.mkdir()
             claude.mkdir(parents=True)
-            (codex / "models_cache.json").write_text(json.dumps({"models": [
-                {"slug": "gpt-6-sol", "display_name": "GPT-6 Sol", "visibility": "list",
-                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "ultra"}]},
-                {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"}]}))
             (claude / "catalog.json").write_text(json.dumps({"catalog": {"config": {"models": [
                 {"id": "claude-opus-5-5", "name": "Opus 5.5",
                  "thinking": {"effort_options": [{"id": "medium"}, {"id": "max"}]}},
                 {"id": "-bad", "name": "Bad"}]}}}))
-            with mock.patch.dict(os.environ, {"HOME": home}):
+            codex_catalog = {"models": [
+                {"slug": "gpt-6-sol", "display_name": "GPT-6 Sol", "visibility": "list",
+                 "supported_reasoning_levels": [{"effort": "low"}, {"effort": "ultra"}]},
+                {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"}]}
+            def fake_run(argv, *args, **kwargs):
+                self.assertEqual(argv, ["codex", "debug", "models"])
+                self.assertEqual(args[:2], (HELPER.AI_CATALOG_BYTES, HELPER.AI_CATALOG_DEADLINE))
+                return json.dumps(codex_catalog).encode(), False, 0
+            with mock.patch.dict(os.environ, {"HOME": home}), \
+                 mock.patch.object(HELPER.shutil, "which", return_value="/usr/bin/codex"), \
+                 mock.patch.object(HELPER, "run_bounded", side_effect=fake_run):
                 catalogs = HELPER.ai_catalogs()
         self.assertEqual(catalogs["codex"], [
             {"id": "gpt-6-sol", "name": "GPT-6 Sol", "efforts": ["low", "ultra"]}])
         self.assertEqual(catalogs["claude"], [
             {"id": "claude-opus-5-5", "name": "Opus 5.5", "efforts": ["medium", "max"]}])
+
+    def test_codex_output_schemas_match_structured_output_contract(self):
+        root = Path(HELPER.__file__).resolve().parent.parent / "resources"
+        unsupported = {"maxLength"}
+        for name in ("ai-result.schema.json", "ai-weather-result.schema.json"):
+            schema = json.loads((root / name).read_text())
+            def visit(value):
+                if isinstance(value, dict):
+                    self.assertFalse(unsupported.intersection(value))
+                    if value.get("type") == "object":
+                        properties = value.get("properties", {})
+                        self.assertEqual(set(value.get("required", [])), set(properties))
+                        self.assertIs(value.get("additionalProperties"), False)
+                    for child in value.values():
+                        visit(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        visit(child)
+            visit(schema)
+        answer_schema = json.loads((root / "ai-result.schema.json").read_text())
+        self.assertEqual(answer_schema["properties"]["artifacts"]["maxItems"], 2)
+        self.assertEqual(answer_schema["properties"]["artifacts"]["items"]["anyOf"][0]
+                         ["properties"]["latitude"]["type"], "number")
+        weather_schema = json.loads((root / "ai-weather-result.schema.json").read_text())
+        self.assertEqual(weather_schema["properties"]["weather"]["anyOf"][0]
+                         ["properties"]["days"]["maxItems"], 7)
 
     def test_bounded_deadline_includes_stalled_stdin(self):
         started = time.monotonic()
